@@ -2,12 +2,13 @@
 // 键盘录入：字母=拟音字落字，数字=时值，方向键移动，Space 播放，+/- 调 BPM
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
-import { TICKS_PER_BEAT, type Hit, type Score, type Step, type Tech } from '../types';
+import { TICKS_PER_BEAT, type Bar, type Hit, type Score, type Step, type Tech } from '../types';
 import { barTicks, setStepAt, stepAtOffset } from '../lib/grid';
 import { resolveKey, TECH_NAMES } from '../lib/glyphs';
 import { emptyBar } from '../lib/factory';
 import { getScore, saveScore } from '../lib/storage';
 import { useAudio } from '../hooks/useAudio';
+import { useHistory } from '../hooks/useHistory';
 import { ScoreGrid, type Selection } from '../components/ScoreGrid';
 import { Transport } from '../components/Transport';
 import { useSettings } from '../settingsContext';
@@ -27,8 +28,22 @@ export function Editor({ scoreId, onNavigate }: Props) {
   const [savedAt, setSavedAt] = useState<string>('');
   const [err, setErr] = useState<string>('');
   const audio = useAudio(score ?? ({ bars: [] } as unknown as Score));
+  // 编辑历史：只快照 bars（落字/休止/连线/技法/拍号/±小节都只动 bars），
+  // 标题/BPM 等元数据不进历史，撤销时也不会被一起回滚。
+  const {
+    push: histPush,
+    reset: histReset,
+    undo: histUndo,
+    redo: histRedo,
+    canUndo,
+    canRedo,
+    undoCount,
+    redoCount,
+  } = useHistory<Bar[]>();
 
+  // 换到另一份曲目或重新载入（scoreId 变化/重挂载）时历史清空，不能在别的谱上接着退
   useEffect(() => {
+    histReset();
     getScore(scoreId).then((s) => {
       if (s) {
         setScore(s);
@@ -37,7 +52,7 @@ export function Editor({ scoreId, onNavigate }: Props) {
         setErr('未找到该曲目');
       }
     });
-  }, [scoreId]);
+  }, [scoreId, histReset]);
 
   // 自动保存（防抖）
   const saveTimer = useRef<number>(0);
@@ -58,25 +73,67 @@ export function Editor({ scoreId, onNavigate }: Props) {
     setScore((s) => (s ? fn(s) : s));
   }, []);
 
-  const editBar = useCallback(
-    (barIdx: number, fn: (steps: Step[]) => Step[] | null) => {
-      patch((s) => {
-        const bars = [...s.bars];
-        const steps = fn(bars[barIdx].steps);
-        if (steps) bars[barIdx] = { ...bars[barIdx], steps };
-        return { ...s, bars };
-      });
+  /** 结构性编辑入口（进历史）：fn 返回新谱；返回 null 或原对象 = 没有改动成功，不进历史 */
+  const commit = useCallback(
+    (fn: (s: Score) => Score | null) => {
+      const s = scoreRef.current;
+      if (!s) return;
+      const next = fn(s);
+      if (!next || next === s) return;
+      histPush(s.bars);
+      setScore(next);
     },
-    [patch],
+    [histPush],
   );
 
-  /** 在 (bar,tick) 放一个 hit（含拆格重建），返回是否成功 */
+  const editBar = useCallback(
+    (barIdx: number, fn: (steps: Step[]) => Step[] | null) => {
+      commit((s) => {
+        const bar = s.bars[barIdx];
+        if (!bar) return null;
+        const steps = fn(bar.steps);
+        if (!steps) return null; // 改动失败 → 不进历史
+        return { ...s, bars: s.bars.map((b, i) => (i === barIdx ? { ...b, steps } : b)) };
+      });
+    },
+    [commit],
+  );
+
+  /** 撤销/重做后小节数或拍号可能变了，把光标夹回有效范围 */
+  const clampSelection = useCallback((bars: Bar[]) => {
+    setSelection((sel) => {
+      const bar = Math.min(sel.bar, bars.length - 1);
+      const tick = Math.min(sel.tick, barTicks(bars[bar].beatsPerBar) - 1);
+      return bar === sel.bar && tick === sel.tick ? sel : { bar, tick };
+    });
+  }, []);
+
+  const undo = useCallback(() => {
+    const s = scoreRef.current;
+    if (!s) return;
+    const bars = histUndo(s.bars);
+    if (!bars) return;
+    setScore({ ...s, bars });
+    clampSelection(bars);
+  }, [histUndo, clampSelection]);
+
+  const redo = useCallback(() => {
+    const s = scoreRef.current;
+    if (!s) return;
+    const bars = histRedo(s.bars);
+    if (!bars) return;
+    setScore({ ...s, bars });
+    clampSelection(bars);
+  }, [histRedo, clampSelection]);
+
+  /** 在 (bar,tick) 放一个 hit（含拆格重建）；拆格失败不落谱、不进历史 */
   const placeHit = useCallback(
     (barIdx: number, tick: number, hit: Hit) => {
-      patch((s) => {
+      commit((s) => {
         const bar = s.bars[barIdx];
+        if (!bar) return null;
         const si = stepAtOffset(bar, tick);
-        if (si < 0) return s;
+        if (si < 0) return null;
         const steps =
           bar.steps[si].beats === duration
             ? bar.steps.map((st, i) =>
@@ -88,13 +145,14 @@ export function Editor({ scoreId, onNavigate }: Props) {
                     }
                   : st,
               )
-            : (setStepAt(bar, tick, { beats: duration, hits: [hit] }) ?? bar.steps);
+            : setStepAt(bar, tick, { beats: duration, hits: [hit] });
+        if (!steps) return null; // 拆格对不上整小节 → 改动失败
         return { ...s, bars: s.bars.map((b, i) => (i === barIdx ? { ...b, steps } : b)) };
       });
       advance(tick);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [patch, duration],
+    [commit, duration],
   );
 
   const advance = useCallback(
@@ -150,6 +208,7 @@ export function Editor({ scoreId, onNavigate }: Props) {
       editBar(barIdx, (steps) => {
         const si = stepAtOffset({ steps }, tick);
         if (si < 0) return null;
+        if (steps[si].hits.length === 0) return null; // 空步没有可切的技法 → 无改动
         return steps.map((s2, i) =>
           i === si
             ? {
@@ -172,6 +231,8 @@ export function Editor({ scoreId, onNavigate }: Props) {
       editBar(barIdx, (steps) => {
         const si = stepAtOffset({ steps }, tick);
         if (si < 0) return null;
+        const st = steps[si];
+        if (!st.hits.length && !st.rest && !st.tie) return null; // 本就是空步 → 无改动
         return steps.map((s2, i) => (i === si ? { ...s2, hits: [], rest: false, tie: false } : s2));
       });
     },
@@ -185,6 +246,21 @@ export function Editor({ scoreId, onNavigate }: Props) {
       const target = e.target as HTMLElement;
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') return;
       const k = e.key;
+      // 撤销/重做：Ctrl/Cmd+Z 撤销，Ctrl/Cmd+Shift+Z 或 Ctrl+Y 重做（输入框已被上面排除，不抢原生撤销）
+      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        const lk = k.toLowerCase();
+        if (lk === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) redo();
+          else undo();
+          return;
+        }
+        if (lk === 'y') {
+          e.preventDefault();
+          redo();
+          return;
+        }
+      }
       if (k === ' ') {
         e.preventDefault();
         audio.playing ? audio.stop() : audio.play();
@@ -239,7 +315,7 @@ export function Editor({ scoreId, onNavigate }: Props) {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [score, selection, settings, instId, placeHit, toggleRest, toggleTie, toggleTech, clearStep, audio],
+    [score, selection, settings, instId, placeHit, toggleRest, toggleTie, toggleTech, clearStep, audio, undo, redo],
   );
 
   const onCellClick = useCallback(
@@ -251,7 +327,8 @@ export function Editor({ scoreId, onNavigate }: Props) {
 
   const changeBeatsPerBar = useCallback(
     (bpb: number) => {
-      patch((s) => {
+      commit((s) => {
+        if (s.bars.every((b) => b.beatsPerBar === bpb)) return null; // 拍号没变 → 无改动
         const bars = s.bars.map((bar, i) => {
           // 保留原 hit 的绝对位置
           const offsets: number[] = [];
@@ -276,24 +353,24 @@ export function Editor({ scoreId, onNavigate }: Props) {
           );
           return nb;
         });
-        return { ...s, bars, freeMeter: bpb === 0 ? s.freeMeter : s.freeMeter };
+        return { ...s, bars };
       });
     },
-    [patch],
+    [commit],
   );
 
   const addBars = useCallback(() => {
-    patch((s) => {
+    commit((s) => {
       const bpb = s.bars[0]?.beatsPerBar ?? 4;
       const bars = [...s.bars];
       for (let i = 0; i < 4; i++) bars.push(emptyBar(bars.length, bpb));
       return { ...s, bars };
     });
-  }, [patch]);
+  }, [commit]);
 
   const removeLastBar = useCallback(() => {
-    patch((s) => (s.bars.length <= 1 ? s : { ...s, bars: s.bars.slice(0, -1) }));
-  }, [patch]);
+    commit((s) => (s.bars.length <= 1 ? null : { ...s, bars: s.bars.slice(0, -1) })); // 只剩 1 小节 → 无改动
+  }, [commit]);
 
   const durationLabel = useMemo(
     () => DURATIONS.find((d) => d.ticks === duration)?.name ?? `${duration} 格`,
@@ -338,6 +415,12 @@ export function Editor({ scoreId, onNavigate }: Props) {
         </button>
         <button className="btn" onClick={removeLastBar}>
           −末小节
+        </button>
+        <button className="btn" data-testid="btn-undo" disabled={!canUndo} onClick={undo} title="撤销上一步 (Ctrl+Z)">
+          ↩ 撤销 <span data-testid="undo-count">{undoCount}</span>
+        </button>
+        <button className="btn" data-testid="btn-redo" disabled={!canRedo} onClick={redo} title="重做 (Ctrl+Shift+Z)">
+          ↪ 重做 <span data-testid="redo-count">{redoCount}</span>
         </button>
         <button className="btn" data-testid="btn-print" onClick={() => onNavigate(`#/score/${score.id}/print`)}>
           出谱打印
@@ -397,6 +480,7 @@ export function Editor({ scoreId, onNavigate }: Props) {
             </p>
             <p>0=休止 T=连线 E=滚 R=闷 Y=双打 Backspace=清除</p>
             <p>←→ 移格 ↑↓ 换乐器 Space 播放 +/− 调速</p>
+            <p>Ctrl+Z 撤销 Ctrl+Shift+Z 重做</p>
             <p>
               当前时值：<b data-testid="cur-duration">{durationLabel}</b>
             </p>

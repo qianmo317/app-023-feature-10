@@ -41,8 +41,8 @@ cd app-023
 npm install
 npm run dev        # 开发服务器（默认 5173）
 npm run build      # tsc -b && vite build（含类型检查）
-npm test           # 单元测试（58 个用例）
-npm run e2e        # Playwright E2E（13 个用例，自动起 4174 preview）
+npm test           # 单元测试（66 个用例）
+npm run e2e        # Playwright E2E（16 个用例，自动起 4174 preview）
 ```
 
 首次跑 E2E 前需安装浏览器：`npx playwright install chromium`。
@@ -80,6 +80,8 @@ npm run e2e        # Playwright E2E（13 个用例，自动起 4174 preview）
 | [lib/audio.ts](src/lib/audio.ts) | 合成音（drum/metal/wood）、lookahead 调度器、事件展开 | `computeEvents` `computeLoopEvents` `scheduleEvents` `playRange` |
 | [lib/storage.ts](src/lib/storage.ts) | IndexedDB CRUD（scores/settings） | `listScores` `getScore` `saveScore` `deleteScore` |
 | [lib/factory.ts](src/lib/factory.ts) | JSON 默认数据 → 对象、曲牌 → Score 转换（跨小节自动切分补休止） | `scoreFromPattern` `newEmptyScore` `emptyBar` |
+| [lib/history.ts](src/lib/history.ts) | 编辑历史栈（纯函数）：入栈/撤销/重做，上限 `HISTORY_LIMIT`=50 步、满了丢最早 | `pushHistory` `undoHistory` `redoHistory` |
+| [hooks/useHistory.ts](src/hooks/useHistory.ts) | 历史栈接 React 状态（ref 镜像，updater 保持纯函数） | `useHistory` |
 | [hooks/useAudio.ts](src/hooks/useAudio.ts) | 播放状态集中管理：ctx/调度/循环/高亮/独奏静音 | `useAudio(score)` |
 | [components/ScoreGrid.tsx](src/components/ScoreGrid.tsx) | SVG 谱面：时间×乐器网格、时值线、tie 延伸、齐奏同列、选中光标、高亮列 | `<ScoreGrid>` |
 | [components/Transport.tsx](src/components/Transport.tsx) | 试听控制台：播放/BPM/循环/高亮开关 | `<Transport>` |
@@ -152,6 +154,15 @@ npm run e2e        # Playwright E2E（13 个用例，自动起 4174 preview）
 
 编辑器快捷键集中在 [Editor.tsx](src/pages/Editor.tsx) `onKey`：先 `if (target.tagName === 'INPUT'...)` 排除输入框，再按功能分支；修改谱面的操作必须走 `patch/editBar`（不可变更新 + 铺满校验）。
 
+### 5.6 编辑历史（撤销/重做）
+
+- 结构性编辑（落字/休止/连线/技法/清除/拍号/±小节）一律走 [Editor.tsx](src/pages/Editor.tsx) 的 `commit(fn)`：`fn` 返回新谱才入栈并落谱；返回 `null` 或原对象 = 没有改动成功，**不进历史**。
+- 历史快照只存 `bars`（上述动作都只动 `bars`），标题/BPM 等元数据不进历史、撤销时也不会被回滚。
+- 上限 `HISTORY_LIMIT = 50` 步（[lib/history.ts](src/lib/history.ts)），满了丢最早一步；撤销后发生新改动会清空重做栈。
+- 换曲目或重新载入（`scoreId` 变化/重挂载）时 `histReset()` 清空，不能在别的谱上接着退。
+- UI：编辑器头部「↩ 撤销 n / ↪ 重做 n」按钮（不可用时禁用，数字为可退/可重做步数）；快捷键 `Ctrl/Cmd+Z` 撤销、`Ctrl/Cmd+Shift+Z` 或 `Ctrl+Y` 重做。
+- 栈逻辑是纯函数（`pushHistory`/`undoHistory`/`redoHistory`），单测在 `tests/history.test.ts`；改历史行为 → 必跑该测试。
+
 ## 6. 测试
 
 ### 6.1 布局
@@ -161,7 +172,8 @@ tests/grid.test.ts      26 用例：时值换算、切分偏移、拆格、宽�
 tests/glyphs.test.ts    18 用例：反查、技法区分、键位解析、防串乐器、冲突抛错
 tests/scheduler.test.ts  9 用例：漂移(<1e-9s)、齐奏同刻、循环相位、散板伸缩、lookahead 行为
 tests/storage.test.ts    5 用例：CRUD、排序、覆盖更新、设置往返（fake-indexeddb）
-e2e/app.spec.ts         13 用例：真实点击全链路（见 6.3）
+tests/history.test.ts    8 用例：入栈/连退/重做往返/上限丢最早/新改动清空重做栈
+e2e/app.spec.ts         16 用例：真实点击全链路（见 6.3）
 ```
 
 ### 6.2 约定

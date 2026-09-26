@@ -193,6 +193,96 @@ test.describe('打印', () => {
   });
 });
 
+test.describe('撤销/重做', () => {
+  test('落字进历史：按钮步数可见，可连退、可重做（按钮与 Ctrl+Z）', async ({ page }) => {
+    await createEmptyScore(page, 'E2E 历史');
+    // 初始：不能退也不能重做
+    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+    await expect(page.getByTestId('btn-redo')).toBeDisabled();
+    await expect(page.getByTestId('undo-count')).toHaveText('0');
+    // 落两字 → 历史 2 步
+    await page.getByTestId('grid-cell-0-0').click();
+    await page.keyboard.type('z'); // 鼓·咚 落 0 格，光标进到 4 格
+    await page.keyboard.type('a'); // 小锣·才 落 4 格
+    await expect(page.getByTestId('grid-glyph-0-0-gu')).toBeVisible();
+    await expect(page.getByTestId('grid-glyph-0-4-xiaoluo')).toBeVisible();
+    await expect(page.getByTestId('undo-count')).toHaveText('2');
+    // 连退两步：两字依次消失
+    await page.getByTestId('btn-undo').click();
+    await expect(page.getByTestId('grid-glyph-0-4-xiaoluo')).toHaveCount(0);
+    await expect(page.getByTestId('grid-glyph-0-0-gu')).toBeVisible();
+    await expect(page.getByTestId('undo-count')).toHaveText('1');
+    await expect(page.getByTestId('redo-count')).toHaveText('1');
+    await page.getByTestId('btn-undo').click();
+    await expect(page.getByTestId('grid-glyph-0-0-gu')).toHaveCount(0);
+    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+    // 再往前走回去
+    await page.getByTestId('btn-redo').click();
+    await page.getByTestId('btn-redo').click();
+    await expect(page.getByTestId('grid-glyph-0-0-gu')).toBeVisible();
+    await expect(page.getByTestId('grid-glyph-0-4-xiaoluo')).toBeVisible();
+    await expect(page.getByTestId('btn-redo')).toBeDisabled();
+    // 键盘 Ctrl+Z / Ctrl+Shift+Z
+    await page.getByTestId('grid-cell-0-0').click(); // 焦点收回编辑区
+    await page.keyboard.press('Control+z');
+    await expect(page.getByTestId('grid-glyph-0-4-xiaoluo')).toHaveCount(0);
+    await page.keyboard.press('Control+Shift+z');
+    await expect(page.getByTestId('grid-glyph-0-4-xiaoluo')).toBeVisible();
+  });
+
+  test('改拍号/增减小节可撤销；没有改动成功的点击不进历史', async ({ page }) => {
+    await createEmptyScore(page, 'E2E 历史守卫');
+    // 空步上切技法、清除空步、末步连线 → 都不是有效改动，不进历史
+    await page.getByTestId('grid-cell-0-0').click();
+    await page.keyboard.press('e');
+    await page.keyboard.press('Backspace');
+    await page.getByTestId('grid-cell-0-13').click(); // 末步覆盖 12–15 格（12 格中心被下一小节行标压住，点 13）
+    await page.keyboard.press('t');
+    await expect(page.getByTestId('undo-count')).toHaveText('0');
+    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+    // 改拍号 4/4 → 2/4 进历史，撤销后还原
+    await page.getByTestId('beats-per-bar').selectOption('2');
+    await expect(page.getByTestId('undo-count')).toHaveText('1');
+    await page.getByTestId('btn-undo').click();
+    await expect(page.getByTestId('beats-per-bar')).toHaveValue('4');
+    // +4 小节进历史；−末小节到只剩 1 小节后不再进历史
+    await page.getByRole('button', { name: '+4 小节' }).click();
+    await expect(page.locator('[data-testid^="grid-bar-"]')).toHaveCount(8);
+    await expect(page.getByTestId('undo-count')).toHaveText('1');
+    for (let i = 0; i < 7; i++) await page.getByRole('button', { name: '−末小节' }).click();
+    await expect(page.locator('[data-testid^="grid-bar-"]')).toHaveCount(1);
+    await expect(page.getByTestId('undo-count')).toHaveText('8'); // 1(加小节)+7(删小节)，最后点不动的不计
+    await page.getByRole('button', { name: '−末小节' }).click(); // 只剩 1 小节 → 无改动
+    await expect(page.getByTestId('undo-count')).toHaveText('8');
+    // 撤销「加 4 小节」之外的删除：连退 7 步回到 8 小节
+    for (let i = 0; i < 7; i++) await page.getByTestId('btn-undo').click();
+    await expect(page.locator('[data-testid^="grid-bar-"]')).toHaveCount(8);
+  });
+
+  test('重新载入同一曲或换到另一份曲目 → 历史清空', async ({ page }) => {
+    await createEmptyScore(page, 'E2E 历史甲');
+    await page.getByTestId('grid-cell-0-0').click();
+    await page.keyboard.type('z');
+    await expect(page.getByTestId('undo-count')).toHaveText('1');
+    // 回列表再进同一曲 → 不能接着退
+    await page.goto('#/');
+    await page.locator('tr', { hasText: 'E2E 历史甲' }).locator('a.score-link').click();
+    await expect(page.getByTestId('editor-page')).toBeVisible();
+    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+    await expect(page.getByTestId('undo-count')).toHaveText('0');
+    // 换到另一份曲目 → 同样清空
+    await createEmptyScore(page, 'E2E 历史乙');
+    await page.getByTestId('grid-cell-0-0').click();
+    await page.keyboard.type('z');
+    await expect(page.getByTestId('undo-count')).toHaveText('1');
+    await page.goto('#/');
+    await page.locator('tr', { hasText: 'E2E 历史甲' }).locator('a.score-link').click();
+    await expect(page.getByTestId('editor-page')).toBeVisible();
+    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+    await expect(page.getByTestId('undo-count')).toHaveText('0');
+  });
+});
+
 test.describe('设置', () => {
   test('改键位并持久化', async ({ page }) => {
     await page.goto('#/settings');
