@@ -167,6 +167,73 @@ test.describe('持久化', () => {
   });
 });
 
+test.describe('编辑历史', () => {
+  test('落字/休止/连线进历史，可连退多步再前进，状态栏显示可退步数', async ({ page }) => {
+    await createEmptyScore(page, 'E2E 历史');
+    // 初始：不可退
+    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+    await expect(page.getByTestId('btn-redo')).toBeDisabled();
+    await expect(page.getByTestId('history-status')).toContainText('不可退');
+    // 三步改动：落字 z、落字 a、休止
+    await page.getByTestId('grid-cell-0-0').click();
+    await page.keyboard.type('z');
+    await page.keyboard.type('a');
+    await page.keyboard.press('0');
+    await expect(page.getByTestId('history-status')).toContainText('可退 3 步');
+    // 连退三步：谱面回到空白
+    await page.keyboard.press('Control+z');
+    await page.keyboard.press('Control+z');
+    await page.keyboard.press('Control+z');
+    await expect(page.getByTestId('grid-glyph-0-0-gu')).toHaveCount(0);
+    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+    await expect(page.getByTestId('history-status')).toContainText('可重做 3 步');
+    // 再往前走回去
+    await page.keyboard.press('Control+Shift+z');
+    await page.keyboard.press('Control+Shift+z');
+    await expect(page.getByTestId('grid-glyph-0-0-gu')).toBeVisible();
+    await expect(page.getByTestId('history-status')).toContainText('可退 2 步');
+    // 后退途中新改动 → 重做栈清空
+    await page.keyboard.press('Control+z');
+    await page.keyboard.type('v');
+    await expect(page.getByTestId('btn-redo')).toBeDisabled();
+  });
+
+  test('增减小节可撤销；没改动成功的点击不进历史', async ({ page }) => {
+    await createEmptyScore(page, 'E2E 历史2');
+    await page.getByRole('button', { name: '+4 小节' }).click();
+    await expect(page.getByTestId('history-status')).toContainText('可退 1 步');
+    await page.getByTestId('btn-undo').click();
+    expect(await page.locator('[data-testid^="grid-bar-"]').count()).toBe(4);
+    await page.getByTestId('btn-redo').click();
+    expect(await page.locator('[data-testid^="grid-bar-"]').count()).toBe(8);
+    // 空步上切技法 = 无实际改动，不进历史
+    const before = await page.getByTestId('history-status').textContent();
+    await page.getByTestId('grid-cell-0-0').click();
+    await page.keyboard.press('e');
+    await expect(page.getByTestId('history-status')).toHaveText(before!);
+  });
+
+  test('换曲目后历史清空，不能在别的谱上接着退', async ({ page }) => {
+    await createEmptyScore(page, 'E2E 历史甲');
+    await page.getByTestId('grid-cell-0-0').click();
+    await page.keyboard.type('z');
+    await expect(page.getByTestId('history-status')).toContainText('可退 1 步');
+    // 回列表另建一份曲目 → 历史必须清空
+    await page.goto('#/');
+    await createEmptyScore(page, 'E2E 历史乙');
+    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+    await expect(page.getByTestId('history-status')).toContainText('不可退');
+    // 重新载入同一份曲目（刷新）→ 历史同样清空
+    await page.getByTestId('grid-cell-0-0').click();
+    await page.keyboard.type('z');
+    await expect(page.getByTestId('history-status')).toContainText('可退 1 步');
+    await page.waitForTimeout(800); // 等自动保存
+    await page.reload();
+    await expect(page.getByTestId('editor-page')).toBeVisible();
+    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+  });
+});
+
 test.describe('打印', () => {
   test('打印视图：A4 横排、简谱对照开关、打印/PNG 按钮', async ({ page }) => {
     await page.goto('#/library');

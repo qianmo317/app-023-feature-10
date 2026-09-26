@@ -6,6 +6,7 @@ import { TICKS_PER_BEAT, type Hit, type Score, type Step, type Tech } from '../t
 import { barTicks, setStepAt, stepAtOffset } from '../lib/grid';
 import { resolveKey, TECH_NAMES } from '../lib/glyphs';
 import { emptyBar } from '../lib/factory';
+import { createHistory, pushHistory, redoHistory, undoHistory, type History } from '../lib/history';
 import { getScore, saveScore } from '../lib/storage';
 import { useAudio } from '../hooks/useAudio';
 import { ScoreGrid, type Selection } from '../components/ScoreGrid';
@@ -26,9 +27,14 @@ export function Editor({ scoreId, onNavigate }: Props) {
   const [selectedInst, setSelectedInst] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string>('');
   const [err, setErr] = useState<string>('');
+  // 编辑历史：换曲目/重新载入时清空；histCounts 驱动「能否退/能退几步」的展示
+  const histRef = useRef<History<Score>>(createHistory());
+  const [histCounts, setHistCounts] = useState({ undo: 0, redo: 0 });
   const audio = useAudio(score ?? ({ bars: [] } as unknown as Score));
 
   useEffect(() => {
+    histRef.current = createHistory(); // 换曲目或重新载入：历史清空，不能接着别的谱退
+    setHistCounts({ undo: 0, redo: 0 });
     getScore(scoreId).then((s) => {
       if (s) {
         setScore(s);
@@ -54,16 +60,80 @@ export function Editor({ scoreId, onNavigate }: Props) {
 
   const instId = selectedInst ?? score?.instruments[0]?.id ?? null;
 
-  const patch = useCallback((fn: (s: Score) => Score) => {
-    setScore((s) => (s ? fn(s) : s));
+  const scoreRef = useRef<Score | null>(null);
+  scoreRef.current = score;
+  const durationRef = useRef(duration);
+  durationRef.current = duration;
+
+  const syncHistCounts = useCallback(() => {
+    setHistCounts({ undo: histRef.current.past.length, redo: histRef.current.future.length });
   }, []);
+
+  /** 改谱面：改动成功才把「改动前」快照压入历史；无实际改动（引用或内容相同）不进历史 */
+  const patch = useCallback(
+    (fn: (s: Score) => Score) => {
+      const s = scoreRef.current;
+      if (!s) return;
+      const next = fn(s);
+      if (next === s || JSON.stringify(next) === JSON.stringify(s)) return;
+      histRef.current = pushHistory(histRef.current, s);
+      scoreRef.current = next;
+      setScore(next);
+      syncHistCounts();
+    },
+    [syncHistCounts],
+  );
+
+  /** 改元信息（标题/流派/BPM/散板开关）：直接生效，不进历史 */
+  const patchQuiet = useCallback((fn: (s: Score) => Score) => {
+    const s = scoreRef.current;
+    if (!s) return;
+    const next = fn(s);
+    if (next === s) return;
+    scoreRef.current = next;
+    setScore(next);
+  }, []);
+
+  /** 撤销/重做后谱面可能变短，把选区钳回有效范围 */
+  const clampSelection = useCallback((s: Score) => {
+    setSelection((sel) => {
+      const bar = Math.min(sel.bar, s.bars.length - 1);
+      const tick = Math.min(sel.tick, barTicks(s.bars[bar].beatsPerBar) - 1);
+      return bar === sel.bar && tick === sel.tick ? sel : { bar, tick };
+    });
+  }, []);
+
+  const undo = useCallback(() => {
+    const s = scoreRef.current;
+    if (!s) return;
+    const [h, prev] = undoHistory(histRef.current, s);
+    if (prev === undefined) return;
+    histRef.current = h;
+    scoreRef.current = prev;
+    setScore(prev);
+    clampSelection(prev);
+    syncHistCounts();
+  }, [syncHistCounts, clampSelection]);
+
+  const redo = useCallback(() => {
+    const s = scoreRef.current;
+    if (!s) return;
+    const [h, next] = redoHistory(histRef.current, s);
+    if (next === undefined) return;
+    histRef.current = h;
+    scoreRef.current = next;
+    setScore(next);
+    clampSelection(next);
+    syncHistCounts();
+  }, [syncHistCounts, clampSelection]);
 
   const editBar = useCallback(
     (barIdx: number, fn: (steps: Step[]) => Step[] | null) => {
       patch((s) => {
+        const steps = fn(s.bars[barIdx].steps);
+        if (!steps) return s; // 没改动成功
         const bars = [...s.bars];
-        const steps = fn(bars[barIdx].steps);
-        if (steps) bars[barIdx] = { ...bars[barIdx], steps };
+        bars[barIdx] = { ...bars[barIdx], steps };
         return { ...s, bars };
       });
     },
@@ -114,10 +184,6 @@ export function Editor({ scoreId, onNavigate }: Props) {
     },
     [],
   );
-  const scoreRef = useRef<Score | null>(null);
-  scoreRef.current = score;
-  const durationRef = useRef(duration);
-  durationRef.current = duration;
 
   const toggleRest = useCallback(
     (barIdx: number, tick: number) => {
@@ -185,17 +251,32 @@ export function Editor({ scoreId, onNavigate }: Props) {
       const target = e.target as HTMLElement;
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') return;
       const k = e.key;
+      // 撤销/重做：Ctrl/Cmd+Z 后退，Ctrl/Cmd+Shift+Z 或 Ctrl+Y 前进
+      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        const kk = k.toLowerCase();
+        if (kk === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) redo();
+          else undo();
+          return;
+        }
+        if (kk === 'y') {
+          e.preventDefault();
+          redo();
+          return;
+        }
+      }
       if (k === ' ') {
         e.preventDefault();
         audio.playing ? audio.stop() : audio.play();
         return;
       }
       if (k === '+' || k === '=') {
-        patch((s) => ({ ...s, bpm: Math.min(240, s.bpm + 2) }));
+        patchQuiet((s) => ({ ...s, bpm: Math.min(240, s.bpm + 2) }));
         return;
       }
       if (k === '-' || k === '_') {
-        patch((s) => ({ ...s, bpm: Math.max(30, s.bpm - 2) }));
+        patchQuiet((s) => ({ ...s, bpm: Math.max(30, s.bpm - 2) }));
         return;
       }
       if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {
@@ -239,7 +320,7 @@ export function Editor({ scoreId, onNavigate }: Props) {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [score, selection, settings, instId, placeHit, toggleRest, toggleTie, toggleTech, clearStep, audio],
+    [score, selection, settings, instId, placeHit, toggleRest, toggleTie, toggleTech, clearStep, undo, redo, audio],
   );
 
   const onCellClick = useCallback(
@@ -313,13 +394,13 @@ export function Editor({ scoreId, onNavigate }: Props) {
           className="title-input"
           data-testid="score-title"
           value={score.title}
-          onChange={(e) => patch((s) => ({ ...s, title: e.target.value }))}
+          onChange={(e) => patchQuiet((s) => ({ ...s, title: e.target.value }))}
         />
         <input
           className="style-input"
           placeholder="流派/剧种"
           value={score.style ?? ''}
-          onChange={(e) => patch((s) => ({ ...s, style: e.target.value }))}
+          onChange={(e) => patchQuiet((s) => ({ ...s, style: e.target.value }))}
         />
         <label>
           拍号
@@ -330,7 +411,7 @@ export function Editor({ scoreId, onNavigate }: Props) {
           </select>
         </label>
         <label className="dim">
-          <input type="checkbox" data-testid="chk-freemeter" checked={score.freeMeter} onChange={(e) => patch((s) => ({ ...s, freeMeter: e.target.checked }))} />
+          <input type="checkbox" data-testid="chk-freemeter" checked={score.freeMeter} onChange={(e) => patchQuiet((s) => ({ ...s, freeMeter: e.target.checked }))} />
           散板
         </label>
         <button className="btn" onClick={addBars}>
@@ -339,6 +420,28 @@ export function Editor({ scoreId, onNavigate }: Props) {
         <button className="btn" onClick={removeLastBar}>
           −末小节
         </button>
+        <button
+          className="btn"
+          data-testid="btn-undo"
+          disabled={histCounts.undo === 0}
+          onClick={undo}
+          title="撤销 (Ctrl+Z)"
+        >
+          ↩ 撤销{histCounts.undo > 0 ? `(${histCounts.undo})` : ''}
+        </button>
+        <button
+          className="btn"
+          data-testid="btn-redo"
+          disabled={histCounts.redo === 0}
+          onClick={redo}
+          title="重做 (Ctrl+Shift+Z / Ctrl+Y)"
+        >
+          ↪ 重做{histCounts.redo > 0 ? `(${histCounts.redo})` : ''}
+        </button>
+        <span className="dim history-status" data-testid="history-status">
+          {histCounts.undo > 0 ? `可退 ${histCounts.undo} 步` : '不可退'}
+          {histCounts.redo > 0 ? ` · 可重做 ${histCounts.redo} 步` : ''}
+        </span>
         <button className="btn" data-testid="btn-print" onClick={() => onNavigate(`#/score/${score.id}/print`)}>
           出谱打印
         </button>
@@ -396,7 +499,7 @@ export function Editor({ scoreId, onNavigate }: Props) {
               <b>录入</b>：字母落字（见设置键位表）；数字 1/2/4/6/8 = 整/半/¼/附点/附点半
             </p>
             <p>0=休止 T=连线 E=滚 R=闷 Y=双打 Backspace=清除</p>
-            <p>←→ 移格 ↑↓ 换乐器 Space 播放 +/− 调速</p>
+            <p>←→ 移格 ↑↓ 换乐器 Space 播放 +/− 调速 Ctrl+Z 撤销 Ctrl+Shift+Z 重做</p>
             <p>
               当前时值：<b data-testid="cur-duration">{durationLabel}</b>
             </p>
@@ -449,7 +552,7 @@ export function Editor({ scoreId, onNavigate }: Props) {
         score={score}
         playing={audio.playing}
         bpm={score.bpm}
-        onBpmChange={(bpm) => patch((s) => ({ ...s, bpm }))}
+        onBpmChange={(bpm) => patchQuiet((s) => ({ ...s, bpm }))}
         onPlay={() => audio.play()}
         onStop={audio.stop}
         loop={audio.loop}

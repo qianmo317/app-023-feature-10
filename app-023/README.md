@@ -41,8 +41,8 @@ cd app-023
 npm install
 npm run dev        # 开发服务器（默认 5173）
 npm run build      # tsc -b && vite build（含类型检查）
-npm test           # 单元测试（58 个用例）
-npm run e2e        # Playwright E2E（13 个用例，自动起 4174 preview）
+npm test           # 单元测试（63 个用例）
+npm run e2e        # Playwright E2E（16 个用例，自动起 4174 preview）
 ```
 
 首次跑 E2E 前需安装浏览器：`npx playwright install chromium`。
@@ -79,6 +79,7 @@ npm run e2e        # Playwright E2E（13 个用例，自动起 4174 preview）
 | [lib/glyphs.ts](src/lib/glyphs.ts) | 拟音字↔乐器/技法反查、键位解析、防串乐器校验 | `buildGlyphMap` `resolveKey` `lookupGlyph` `validateHitGlyphs` |
 | [lib/audio.ts](src/lib/audio.ts) | 合成音（drum/metal/wood）、lookahead 调度器、事件展开 | `computeEvents` `computeLoopEvents` `scheduleEvents` `playRange` |
 | [lib/storage.ts](src/lib/storage.ts) | IndexedDB CRUD（scores/settings） | `listScores` `getScore` `saveScore` `deleteScore` |
+| [lib/history.ts](src/lib/history.ts) | 编辑历史：过去/未来双栈快照，上限 50 步满则丢最早；纯函数不依赖 React | `createHistory` `pushHistory` `undoHistory` `redoHistory` |
 | [lib/factory.ts](src/lib/factory.ts) | JSON 默认数据 → 对象、曲牌 → Score 转换（跨小节自动切分补休止） | `scoreFromPattern` `newEmptyScore` `emptyBar` |
 | [hooks/useAudio.ts](src/hooks/useAudio.ts) | 播放状态集中管理：ctx/调度/循环/高亮/独奏静音 | `useAudio(score)` |
 | [components/ScoreGrid.tsx](src/components/ScoreGrid.tsx) | SVG 谱面：时间×乐器网格、时值线、tie 延伸、齐奏同列、选中光标、高亮列 | `<ScoreGrid>` |
@@ -116,6 +117,14 @@ npm run e2e        # Playwright E2E（13 个用例，自动起 4174 preview）
 
 不画严格拍格、时值线为相对宽度；播放按「等格时长 × `currentBeatStretch`」近似，UI 明确标注为近似。
 
+### 4.5 编辑历史（撤销/重做）
+
+- 编辑器内一切**改谱面**的操作（落字、改时值、休止、连线、技法、清除、拍号、增减小节）都经 `patch`：改动成功后把「改动前」的 Score 快照压入 `past` 栈，可 Ctrl+Z 连退、Ctrl+Shift+Z / Ctrl+Y 前进；标题/流派/BPM/散板开关走 `patchQuiet`，不进历史。
+- **无实际改动不进历史**：`patch` 先比对结果（引用或内容相同即视为没改动成功），如空步上切技法、末步上连线都不会产生历史。
+- 上限 `HISTORY_LIMIT = 50` 步，满则丢最早一步；任何新改动清空重做栈。
+- 历史只活在内存：换曲目（`scoreId` 变化）或刷新页面即重建为空，不会在别的谱上接着退；谱面本身仍由自动保存持久化。
+- 头部按钮 `btn-undo/btn-redo` 禁用态 + `history-status` 文案（可退 N 步 / 可重做 M 步）实时反映栈深。
+
 ## 5. 常见开发任务
 
 ### 5.1 新增乐器
@@ -150,7 +159,7 @@ npm run e2e        # Playwright E2E（13 个用例，自动起 4174 preview）
 
 ### 5.5 新增编辑功能（快捷键）
 
-编辑器快捷键集中在 [Editor.tsx](src/pages/Editor.tsx) `onKey`：先 `if (target.tagName === 'INPUT'...)` 排除输入框，再按功能分支；修改谱面的操作必须走 `patch/editBar`（不可变更新 + 铺满校验）。
+编辑器快捷键集中在 [Editor.tsx](src/pages/Editor.tsx) `onKey`：先 `if (target.tagName === 'INPUT'...)` 排除输入框，再按功能分支；修改谱面的操作必须走 `patch/editBar`（不可变更新 + 铺满校验 + 自动进编辑历史，见 §4.5）；改元信息（标题/BPM 等）用 `patchQuiet`，不进历史。
 
 ## 6. 测试
 
@@ -161,7 +170,8 @@ tests/grid.test.ts      26 用例：时值换算、切分偏移、拆格、宽�
 tests/glyphs.test.ts    18 用例：反查、技法区分、键位解析、防串乐器、冲突抛错
 tests/scheduler.test.ts  9 用例：漂移(<1e-9s)、齐奏同刻、循环相位、散板伸缩、lookahead 行为
 tests/storage.test.ts    5 用例：CRUD、排序、覆盖更新、设置往返（fake-indexeddb）
-e2e/app.spec.ts         13 用例：真实点击全链路（见 6.3）
+tests/history.test.ts    5 用例：连退/连进、上限丢最早、新改动清空重做栈、换曲目清空
+e2e/app.spec.ts         16 用例：真实点击全链路（见 6.3）
 ```
 
 ### 6.2 约定

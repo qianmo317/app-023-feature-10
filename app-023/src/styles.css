@@ -31,6 +31,8 @@ h2 { font-size: 16px; margin: 18px 0 6px; border-left: 3px solid var(--red); pad
   cursor: pointer; font-size: 14px; color: var(--ink); text-decoration: none; display: inline-block;
 }
 .btn:hover { border-color: var(--red); color: var(--red); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled:hover { border-color: var(--border); color: var(--ink); }
 .btn.primary { background: var(--red); border-color: var(--red); color: #fff; }
 .btn.primary:hover { opacity: 0.9; color: #fff; }
 .btn-sm { border: 1px solid var(--border); background: #fff; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 12px; }
